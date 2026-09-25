@@ -1,0 +1,6 @@
+{
+  "name": "FairRoll: Provably Fair Crypto Micro-Boxes",
+  "description": "Transparent, low-stakes crypto mystery boxes ($0.50-$5) featuring mathematically disclosed odds, cryptographic seed verification, and verifiable RTP.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
