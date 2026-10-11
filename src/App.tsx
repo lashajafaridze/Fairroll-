@@ -1,5 +1,14 @@
 import React, { useState, useEffect, useMemo } from 'react';
-import { BoxTier, CryptoCurrency, GameMode, ProvablyFairPair, RollResult, WalletState } from './types';
+import {
+  BoxTier,
+  CryptoCurrency,
+  GameMode,
+  ProvablyFairPair,
+  RollResult,
+  WalletState,
+  UserProfile,
+  ConnectedWallet,
+} from './types';
 import { BOX_TIERS } from './data/boxes';
 import { generateBoxForModeAndBet } from './data/gameModes';
 import { sha256, generateRandomSeed, calculateRollOutcome } from './utils/crypto';
@@ -11,30 +20,53 @@ import { ProvablyFairModal } from './components/ProvablyFairModal';
 import { RollHistory } from './components/RollHistory';
 import { ResponsibleModal } from './components/ResponsibleModal';
 import { ModelDistributionInspector } from './components/ModelDistributionInspector';
+import { ConnectWalletModal } from './components/ConnectWalletModal';
+import { AuthModal } from './components/AuthModal';
+import { UserDashboardModal } from './components/UserDashboardModal';
+import { AdminPanelModal } from './components/AdminPanelModal';
+import { ManagerDashboardModal } from './components/ManagerDashboardModal';
+import {
+  getActiveUser,
+  setActiveUser,
+  connectUserWallet,
+  disconnectUserWallet,
+  adjustUserBalance,
+  getStoredUsers,
+} from './utils/userStore';
+import {
+  getManagerControls,
+  applyManagerOverrides,
+  recordLiveBet,
+} from './utils/managerStore';
 import { ShieldCheck, Sparkles, AlertTriangle, ExternalLink, HelpCircle, Lock } from 'lucide-react';
 
 export default function App() {
-  // Wallet State with LocalStorage fallbacks
+  // Active Logged-in User
+  const [currentUser, setCurrentUser] = useState<UserProfile>(() => getActiveUser());
+
+  // Wallet State synchronized with active user
   const [wallet, setWallet] = useState<WalletState>(() => {
-    const saved = localStorage.getItem('fairroll_wallet');
-    if (saved) {
-      try {
-        const parsed = JSON.parse(saved);
-        if (parsed.balanceUsd < 20) parsed.balanceUsd = 100.0;
-        parsed.dailySpendLimit = 9999999; // Limits OFF: Unlimited trading
-        return parsed;
-      } catch {}
-    }
+    const user = getActiveUser();
     return {
-      balanceUsd: 100.0,
+      balanceUsd: user.balanceUsd || 250.0,
       currency: 'USDC',
       dailySpendTotal: 0,
       dailySpendLimit: 9999999, // Limits OFF: Unlimited trading
-      totalWonUsd: 0,
-      totalOpened: 0,
+      totalWonUsd: user.totalWonUsd || 0,
+      totalOpened: user.boxesOpened || 0,
       soundEnabled: true,
     };
   });
+
+  // Keep wallet balance in sync when active user changes
+  useEffect(() => {
+    setWallet((prev) => ({
+      ...prev,
+      balanceUsd: currentUser.balanceUsd,
+      totalWonUsd: currentUser.totalWonUsd,
+      totalOpened: currentUser.boxesOpened,
+    }));
+  }, [currentUser]);
 
   // Fixed game mode (Modes switch deactivated: locked on Crypto Moonshot) and customizable bet
   const [currentMode] = useState<GameMode>('hot');
@@ -72,6 +104,17 @@ export default function App() {
   const [showResponsibleModal, setShowResponsibleModal] = useState(false);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
 
+  // New User & Web3 Modals
+  const [showConnectWalletModal, setShowConnectWalletModal] = useState(false);
+  const [showAuthModal, setShowAuthModal] = useState(false);
+  const [authModalMode, setAuthModalMode] = useState<'login' | 'register'>('register');
+  const [showUserDashboardModal, setShowUserDashboardModal] = useState(false);
+  const [userDashboardTab, setUserDashboardTab] = useState<
+    'balance' | 'history' | 'profile' | 'verification' | 'wallet'
+  >('balance');
+  const [showAdminPanelModal, setShowAdminPanelModal] = useState(false);
+  const [showManagerDashboardModal, setShowManagerDashboardModal] = useState(false);
+
   // Initialize initial Server Seed & Hash on mount
   useEffect(() => {
     const initSeed = async () => {
@@ -85,11 +128,6 @@ export default function App() {
     };
     initSeed();
   }, []);
-
-  // Save wallet updates
-  useEffect(() => {
-    localStorage.setItem('fairroll_wallet', JSON.stringify(wallet));
-  }, [wallet]);
 
   // Save history updates
   useEffect(() => {
@@ -135,11 +173,27 @@ export default function App() {
   const handleOpenBox = async (box: BoxTier) => {
     if (isOpening) return;
 
-    // If balance is below ticket price, auto-replenish demo funds so trading never stops
-    let startingBalance = wallet.balanceUsd;
+    // Check balance; auto-replenish demo funds if needed
+    // Manager Emergency & Maintenance Check
+    const managerControls = getManagerControls();
+    if (managerControls.emergencyStop) {
+      showToast('⚠️ Game is temporarily frozen by Casino Manager. Please standby.');
+      return;
+    }
+
+    let startingBalance = currentUser.balanceUsd;
     if (startingBalance < box.priceUsd) {
-      startingBalance += 100.0;
-      showToast('Auto-replenished +$100.00 USDC demo funds (Limits OFF · Unlimited Trading)!');
+      const replenished = adjustUserBalance(
+        currentUser.id,
+        100.0,
+        'faucet',
+        'Auto-replenish Unlimited Play Demo Grant'
+      );
+      if (replenished) {
+        setCurrentUser(replenished);
+        startingBalance = replenished.balanceUsd;
+      }
+      showToast('Auto-replenished +$100.00 USDC demo funds!');
     }
 
     let sSeed = provablyFair.serverSeed;
@@ -158,11 +212,19 @@ export default function App() {
 
     // Compute outcome deterministically
     const currentNonce = provablyFair.nonce;
-    const { rollNumber, item, wildBonus } = await calculateRollOutcome(
+    const { rollNumber: naturalRoll, item: naturalItem, wildBonus: naturalWild } = await calculateRollOutcome(
       sSeed,
       provablyFair.clientSeed,
       currentNonce,
       box.items
+    );
+
+    // Apply Manager Game Controls & Win/Loss Overrides if active
+    const { rollNumber, wonItem: finalWonItem, wildBonus: finalWild } = applyManagerOverrides(
+      box.items,
+      naturalRoll,
+      naturalItem,
+      naturalWild
     );
 
     const rollRes: RollResult = {
@@ -171,21 +233,24 @@ export default function App() {
       boxId: box.id,
       boxName: box.name,
       boxPriceUsd: box.priceUsd,
-      wonItem: item,
+      wonItem: finalWonItem,
       rollNumber,
       serverSeedHash: provablyFair.serverSeedHash,
       clientSeed: provablyFair.clientSeed,
       nonce: currentNonce,
-      wildBonus,
+      wildBonus: finalWild,
     };
 
-    // Deduct entry price immediately with limits off
-    setWallet((prev) => ({
-      ...prev,
-      balanceUsd: startingBalance - box.priceUsd,
-      dailySpendTotal: prev.dailySpendTotal + box.priceUsd,
-      totalOpened: prev.totalOpened + 1,
-    }));
+    // Deduct entry price from user account
+    const updatedUser = adjustUserBalance(
+      currentUser.id,
+      -box.priceUsd,
+      'unbox_cost',
+      `Unboxed ${box.name} ($${box.priceUsd.toFixed(2)})`
+    );
+    if (updatedUser) {
+      setCurrentUser(updatedUser);
+    }
 
     // Increment nonce
     setProvablyFair((prev) => ({
@@ -204,12 +269,41 @@ export default function App() {
   const handleReelFinished = () => {
     setIsOpening(false);
     if (activeRollResult) {
-      // Credit prize to wallet
-      setWallet((prev) => ({
-        ...prev,
-        balanceUsd: prev.balanceUsd + activeRollResult.wonItem.valueUsd,
-        totalWonUsd: prev.totalWonUsd + activeRollResult.wonItem.valueUsd,
-      }));
+      // Credit prize to user account in userStore
+      const updatedUser = adjustUserBalance(
+        currentUser.id,
+        activeRollResult.wonItem.valueUsd,
+        'unbox_win',
+        `Prize won from ${activeRollResult.boxName}: ${activeRollResult.wonItem.name}`
+      );
+      if (updatedUser) {
+        setCurrentUser(updatedUser);
+      }
+
+      // Record in Manager Real-Time Telemetry & Live Bets Stream
+      const profit = activeRollResult.wonItem.valueUsd - activeRollResult.boxPriceUsd;
+      const multiplier = Number(
+        (activeRollResult.wonItem.valueUsd / activeRollResult.boxPriceUsd).toFixed(2)
+      );
+      recordLiveBet({
+        id: `bet-${activeRollResult.id}`,
+        timestamp: Date.now(),
+        userId: currentUser.id,
+        username: currentUser.username,
+        userAvatar: currentUser.avatar,
+        boxId: activeRollResult.boxId,
+        boxName: activeRollResult.boxName,
+        wagerUsd: activeRollResult.boxPriceUsd,
+        payoutUsd: activeRollResult.wonItem.valueUsd,
+        profitUsd: Number(profit.toFixed(2)),
+        isWin: profit > 0,
+        isBigWin: profit > activeRollResult.boxPriceUsd * 3,
+        isLoss: profit <= 0,
+        multiplier,
+        wonItemName: activeRollResult.wonItem.name,
+        wildType: activeRollResult.wildBonus?.type,
+        rollNumber: activeRollResult.rollNumber,
+      });
 
       // Append to audited roll history
       setRollHistory((prev) => [activeRollResult, ...prev]);
@@ -218,10 +312,15 @@ export default function App() {
 
   // Faucet Claim
   const handleClaimFaucet = () => {
-    setWallet((prev) => ({
-      ...prev,
-      balanceUsd: prev.balanceUsd + 50.0,
-    }));
+    const updatedUser = adjustUserBalance(
+      currentUser.id,
+      50.0,
+      'faucet',
+      'Instant Testnet Faucet Claim (+$50)'
+    );
+    if (updatedUser) {
+      setCurrentUser(updatedUser);
+    }
     showToast('+$50.00 USDC Testnet Faucet funds credited!');
   };
 
@@ -230,11 +329,42 @@ export default function App() {
     setShowProvablyFairModal(true);
   };
 
+  // Connect Wallet handlers
+  const handleWalletConnected = (connected: ConnectedWallet) => {
+    const updated = connectUserWallet(currentUser.id, connected);
+    if (updated) {
+      setCurrentUser(updated);
+    }
+    showToast(`Connected ${connected.provider} (${connected.network})!`);
+  };
+
+  const handleWalletDisconnected = () => {
+    const updated = disconnectUserWallet(currentUser.id);
+    if (updated) {
+      setCurrentUser(updated);
+    }
+    showToast('Wallet disconnected.');
+  };
+
+  const handleDepositFromConnectedWallet = (amountUsd: number) => {
+    const updated = adjustUserBalance(
+      currentUser.id,
+      amountUsd,
+      'deposit',
+      `Deposit from connected ${currentUser.connectedWallet?.provider || 'Web3'} wallet`
+    );
+    if (updated) {
+      setCurrentUser(updated);
+    }
+    showToast(`+$${amountUsd.toFixed(2)} USDC successfully deposited!`);
+  };
+
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col selection:bg-cyan-500/30 selection:text-cyan-200">
       {/* Navigation & Header */}
       <Header
         wallet={wallet}
+        user={currentUser}
         onCurrencyChange={(cur) => setWallet((prev) => ({ ...prev, currency: cur }))}
         onClaimFaucet={handleClaimFaucet}
         onToggleSound={() => setWallet((prev) => ({ ...prev, soundEnabled: !prev.soundEnabled }))}
@@ -243,6 +373,17 @@ export default function App() {
           setShowProvablyFairModal(true);
         }}
         onOpenResponsible={() => setShowResponsibleModal(true)}
+        onOpenConnectWallet={() => setShowConnectWalletModal(true)}
+        onOpenUserDashboard={(tab) => {
+          if (tab) setUserDashboardTab(tab);
+          setShowUserDashboardModal(true);
+        }}
+        onOpenAdminPanel={() => setShowAdminPanelModal(true)}
+        onOpenManagerBackend={() => setShowManagerDashboardModal(true)}
+        onOpenAuth={(mode) => {
+          setAuthModalMode(mode || 'register');
+          setShowAuthModal(true);
+        }}
         serverSeedHash={provablyFair.serverSeedHash}
       />
 
@@ -271,7 +412,9 @@ export default function App() {
             currency={wallet.currency}
             soundEnabled={wallet.soundEnabled}
             onFinished={handleReelFinished}
-            onOpenAgain={() => handleOpenBox(activeOpeningBox || generateBoxForModeAndBet('hot', currentBet))}
+            onOpenAgain={() =>
+              handleOpenBox(activeOpeningBox || generateBoxForModeAndBet('hot', currentBet))
+            }
             onVerifyProof={(result) => handleVerifyRoll(result)}
           />
         </section>
@@ -302,10 +445,20 @@ export default function App() {
           </div>
           <div className="flex items-center gap-4 text-slate-400">
             <button
-              onClick={() => setShowResponsibleModal(true)}
+              onClick={() => {
+                setUserDashboardTab('verification');
+                setShowUserDashboardModal(true);
+              }}
               className="hover:text-slate-200 transition-colors"
             >
-              Responsible Gaming Policy
+              KYC & Verification
+            </button>
+            <span>·</span>
+            <button
+              onClick={() => setShowAdminPanelModal(true)}
+              className="hover:text-purple-300 transition-colors text-purple-400 font-medium"
+            >
+              Admin Control Panel
             </button>
             <span>·</span>
             <button
@@ -351,12 +504,74 @@ export default function App() {
           onUpdateLimit={(newLimit) =>
             setWallet((prev) => ({ ...prev, dailySpendLimit: newLimit }))
           }
-          onResetSpend={() =>
-            setWallet((prev) => ({ ...prev, dailySpendTotal: 0 }))
-          }
+          onResetSpend={() => setWallet((prev) => ({ ...prev, dailySpendTotal: 0 }))}
           onClose={() => setShowResponsibleModal(false)}
         />
       )}
+
+      {/* Connect Wallet Modal */}
+      <ConnectWalletModal
+        isOpen={showConnectWalletModal}
+        onClose={() => setShowConnectWalletModal(false)}
+        connectedWallet={currentUser.connectedWallet}
+        onConnect={handleWalletConnected}
+        onDisconnect={handleWalletDisconnected}
+        onDepositFromWallet={handleDepositFromConnectedWallet}
+      />
+
+      {/* Auth & Registration Modal */}
+      <AuthModal
+        isOpen={showAuthModal}
+        onClose={() => setShowAuthModal(false)}
+        initialMode={authModalMode}
+        onAuthSuccess={(u) => {
+          setCurrentUser(u);
+          showToast(`Welcome, ${u.username}! Account active.`);
+        }}
+      />
+
+      {/* User Dashboard Modal (Balance, History, Profile, Verification, Wallet) */}
+      <UserDashboardModal
+        isOpen={showUserDashboardModal}
+        onClose={() => setShowUserDashboardModal(false)}
+        user={currentUser}
+        rollHistory={rollHistory}
+        initialTab={userDashboardTab}
+        onOpenConnectWallet={() => {
+          setShowUserDashboardModal(false);
+          setShowConnectWalletModal(true);
+        }}
+        onOpenVerifier={(roll) => {
+          setShowUserDashboardModal(false);
+          handleVerifyRoll(roll);
+        }}
+        onUserUpdated={(u) => setCurrentUser(u)}
+        onClaimFaucet={handleClaimFaucet}
+      />
+
+      {/* Full User Admin Panel Modal */}
+      <AdminPanelModal
+        isOpen={showAdminPanelModal}
+        onClose={() => setShowAdminPanelModal(false)}
+        currentUser={currentUser}
+        onUserSwitched={(u) => {
+          setCurrentUser(u);
+          showToast(`Switched active session to ${u.username}!`);
+        }}
+      />
+
+      {/* Casino Manager Backend Modal */}
+      <ManagerDashboardModal
+        isOpen={showManagerDashboardModal}
+        onClose={() => setShowManagerDashboardModal(false)}
+        onControlsUpdated={(ctrl) => {
+          if (ctrl.emergencyStop) {
+            showToast('Casino game engine placed on EMERGENCY FREEZE.');
+          } else {
+            showToast('Game backend parameters updated live.');
+          }
+        }}
+      />
 
       {/* Toast Notification */}
       {toastMessage && (
